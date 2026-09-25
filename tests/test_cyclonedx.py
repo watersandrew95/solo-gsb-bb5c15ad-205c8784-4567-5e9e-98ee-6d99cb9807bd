@@ -117,7 +117,8 @@ def test_license_sources() -> None:
             _comp("r2", "by-expression", "1", [{"expression": "GPL-3.0"}]),
             _comp("r3", "by-name", "1", [{"license": {"name": "Apache 2.0"}}]),
             _comp("r4", "missing", "1"),
-            _comp("r5", "weird-expression", "1", [{"expression": "MIT OR Apache-2.0"}]),
+            _comp("r5", "multi-or", "1", [{"expression": "MIT OR Apache-2.0"}]),
+            _comp("r6", "multi-and", "1", [{"expression": "MIT AND Apache-2.0"}]),
         ]
     )
     result = analyzer.analyze_manifest(bom)
@@ -134,11 +135,71 @@ def test_license_sources() -> None:
         and by_id["missing@1"]["license_display"] == "UNLICENSED",
         str(by_id["missing@1"]),
     )
+    multi = by_id["multi-or@1"]
     _check(
-        "composite expression unknown",
-        by_id["weird-expression@1"]["license_known"] is False,
-        str(by_id["weird-expression@1"]),
+        "OR expression becomes candidates",
+        multi["license_known"] is True
+        and multi["license_category"] == "multi-license"
+        and [c["token"] for c in multi["license_candidates"]] == ["MIT", "Apache-2.0"]
+        and multi["license"] == "Apache-2.0 OR MIT",
+        str(multi),
     )
+    _check(
+        "AND expression stays unknown",
+        by_id["multi-and@1"]["license_known"] is False
+        and by_id["multi-and@1"]["license_candidates"] is None,
+        str(by_id["multi-and@1"]),
+    )
+
+
+def test_parallel_license_entries_become_candidates() -> None:
+    bom = _bom(
+        [
+            _comp("dup-lic", "dual", "1", [
+                {"license": {"id": "MIT"}},
+                {"license": {"id": "GPL-2.0"}},
+            ]),
+        ]
+    )
+    result = analyzer.analyze_manifest(bom)
+    node = next(n for n in result["nodes"] if n["id"] == "dual@1")
+    _check(
+        "parallel ids become OR candidates",
+        node["license_category"] == "multi-license"
+        and [c["token"] for c in node["license_candidates"]] == ["MIT", "GPL-2.0"]
+        and node["license_display"] == "MIT OR GPL-2.0",
+        str(node),
+    )
+
+
+def test_duplicate_component_merges_when_candidates_match() -> None:
+    # 同名同版本、候选集合相同但并列顺序不同：视为同一许可证，正常合并
+    bom = _bom(
+        [
+            _comp("ref-a", "dual", "1.0.0", [
+                {"license": {"id": "MIT"}}, {"license": {"id": "GPL-2.0"}},
+            ]),
+            _comp("ref-b", "dual", "1.0.0", [
+                {"license": {"id": "GPL-2.0"}}, {"license": {"id": "MIT"}},
+            ]),
+        ]
+    )
+    result = analyzer.analyze_manifest(bom)
+    _check("reordered candidates merge", result["status"] != "error", result.get("error", ""))
+    _check("single merged node", result["summary"]["packages"] == 1, str(result["summary"]))
+
+
+def test_duplicate_component_rejects_when_candidates_differ() -> None:
+    bom = _bom(
+        [
+            _comp("ref-a", "dual", "1.0.0", [
+                {"license": {"id": "MIT"}}, {"license": {"id": "GPL-2.0"}},
+            ]),
+            _comp("ref-b", "dual", "1.0.0", [{"license": {"id": "MIT"}}]),
+        ]
+    )
+    result = analyzer.analyze_manifest(bom)
+    _check("different candidate sets -> error", result["status"] == "error", result.get("error", ""))
 
 
 def test_same_component_merges_when_license_agrees() -> None:
@@ -274,6 +335,9 @@ def main() -> None:
     test_basic_import_and_conflicts()
     test_bom_ref_mapping()
     test_license_sources()
+    test_parallel_license_entries_become_candidates()
+    test_duplicate_component_merges_when_candidates_match()
+    test_duplicate_component_rejects_when_candidates_differ()
     test_same_component_merges_when_license_agrees()
     test_duplicate_bom_ref_rejected()
     test_conflicting_license_rejected()

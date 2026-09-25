@@ -22,7 +22,10 @@
       "bom-ref": "pkg:npm/web-ui@1.4.2",
       "name": "web-ui",
       "version": "1.4.2",
-      "licenses": [ { "expression": "Apache-2.0" } ]
+      "licenses": [
+        { "license": { "id": "Apache-2.0" } },
+        { "license": { "id": "GPL-3.0" } }
+      ]
     },
     {
       "type": "library",

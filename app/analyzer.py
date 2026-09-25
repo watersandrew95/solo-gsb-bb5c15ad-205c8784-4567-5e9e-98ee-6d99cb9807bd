@@ -156,6 +156,7 @@ def analyze_manifest(manifest: Any, manifest_name: str = "uploaded-manifest") ->
             "license": info["token"],
             "license_known": info["known"],
             "license_category": info["category"],
+            "license_candidates": info.get("license_candidates"),
             "constraints": [],
             "conflict_count": 0,
         }
@@ -318,6 +319,109 @@ def _mark_unresolved(
 # --- 传递约束 + 最短路径冲突 -------------------------------------------------
 
 
+def _node_license_candidates(node: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """取节点参与兼容判定的许可证候选（矩阵内标识）。
+
+    多许可证候选（``license_candidates``，由 OR 表达式 / CycloneDX 并列
+    条目解析而来）逐项参与；其余情况退化为单许可证候选——单许可证的
+    判定语义与 :func:`licenses.compatibility` 完全一致（未知标识会在
+    矩阵判定中返回 warning）。
+    """
+    candidates = node.get("license_candidates")
+    if candidates:
+        return [
+            {
+                "token": str(item["token"]),
+                "display": str(item["display"]),
+                "category": str(item["category"]),
+            }
+            for item in candidates
+        ]
+    return [
+        {
+            "token": str(node["license"]),
+            "display": str(node["license_display"]),
+            "category": str(node.get("license_category") or lic.UNKNOWN),
+        }
+    ]
+
+
+def _node_imposes_constraint(node: Dict[str, Any]) -> bool:
+    """节点的任一许可证候选会向集成它的父作品施加传递约束。"""
+    return any(lic.imposes_constraint(str(item["token"])) for item in _node_license_candidates(node))
+
+
+def _evaluate_license_pair(
+    ancestor_node: Dict[str, Any],
+    dep_node: Dict[str, Any],
+) -> Tuple[str, str, List[Dict[str, Any]]]:
+    """对祖先/依赖两侧的许可证候选做笛卡尔组合，逐一调用兼容矩阵。
+
+    返回 ``(聚合状态, 聚合原因, 各组合判定)``：
+
+    * 全部组合 conflict —— 硬冲突（:data:`lic.CONFLICT`）；
+    * 全部组合 ok —— 通过（:data:`lic.OK`），不产出冲突/告警；
+    * 其余（含任一 warning，或 ok 与 conflict 并存）—— 需人工确认
+      （:data:`lic.WARNING`）。
+
+    两侧均为单许可证时，结果与原先单次矩阵调用完全等价。
+    """
+    ancestor_candidates = _node_license_candidates(ancestor_node)
+    dep_candidates = _node_license_candidates(dep_node)
+    combinations: List[Dict[str, Any]] = []
+    statuses: List[str] = []
+    for ancestor_item in ancestor_candidates:
+        for dep_item in dep_candidates:
+            status, reason = lic.compatibility(
+                str(ancestor_item["token"]), str(dep_item["token"])
+            )
+            statuses.append(status)
+            combinations.append(
+                {
+                    "ancestor_license": ancestor_item["display"],
+                    "ancestor_token": ancestor_item["token"],
+                    "node_license": dep_item["display"],
+                    "node_token": dep_item["token"],
+                    "status": status,
+                    "severity": "error" if status == lic.CONFLICT else (
+                        "warning" if status == lic.WARNING else "ok"
+                    ),
+                    "reason": reason,
+                }
+            )
+
+    if all(status == lic.CONFLICT for status in statuses):
+        aggregate = lic.CONFLICT
+    elif all(status == lic.OK for status in statuses):
+        aggregate = lic.OK
+    else:
+        aggregate = lic.WARNING
+
+    if len(combinations) == 1:
+        summary = combinations[0]["reason"]
+    else:
+        ok_count = sum(1 for status in statuses if status == lic.OK)
+        conflict_count = sum(1 for status in statuses if status == lic.CONFLICT)
+        warning_count = len(statuses) - ok_count - conflict_count
+        if aggregate == lic.CONFLICT:
+            summary = (
+                "多许可证候选共 %d 种组合，全部不兼容（硬冲突）：选择任一候选许可证都无法组合，"
+                "需要更换许可证或调整依赖关系。" % len(combinations)
+            )
+        elif aggregate == lic.OK:
+            summary = (
+                "多许可证候选共 %d 种组合，逐一比对兼容矩阵后全部兼容，可任选候选许可证组合分发。"
+                % len(combinations)
+            )
+        else:
+            summary = (
+                "多许可证候选共 %d 种组合：%d 种兼容、%d 种冲突、%d 种需人工确认；"
+                "并非全部冲突也并非全部兼容，能否组合取决于实际选用的许可证，需要人工确认。"
+                % (len(combinations), ok_count, conflict_count, warning_count)
+            )
+    return aggregate, summary, combinations
+
+
 def _build_result(
     display_name: str,
     raw_manifest: Any,
@@ -349,31 +453,47 @@ def _build_result(
                     visited_ancestors.add(nxt)
                     queue.append(nxt)
 
-                ancestor_token = nodes[ancestor]["license"]
-                dep_token = nodes[nxt]["license"]
-                status, reason = lic.compatibility(ancestor_token, dep_token)
+                ancestor_node = nodes[ancestor]
+                dep_node = nodes[nxt]
+                multi_license = bool(
+                    ancestor_node.get("license_candidates") or dep_node.get("license_candidates")
+                )
+                status, reason, combinations = _evaluate_license_pair(ancestor_node, dep_node)
                 if status != lic.OK:
                     path = _reconstruct_path(parents, ancestor, nxt)
-                    conflicts.append(
-                        {
-                            "kind": "license-conflict",
-                            "severity": "error" if status == lic.CONFLICT else "warning",
-                            "status": status,
-                            "ancestor": ancestor,
-                            "node": nxt,
-                            "ancestor_license": nodes[ancestor]["license_display"],
-                            "node_license": nodes[nxt]["license_display"],
-                            "distance": len(path) - 1,
-                            "path": path,
-                            "reason": reason,
-                        }
-                    )
-                if lic.imposes_constraint(ancestor_token):
+                    entry: Dict[str, Any] = {
+                        "kind": "license-conflict",
+                        "severity": "error" if status == lic.CONFLICT else "warning",
+                        "status": status,
+                        "ancestor": ancestor,
+                        "node": nxt,
+                        "ancestor_license": ancestor_node["license_display"],
+                        "node_license": dep_node["license_display"],
+                        "distance": len(path) - 1,
+                        "path": path,
+                        "reason": reason,
+                    }
+                    if multi_license:
+                        # 多许可证候选：列出全部候选组合的矩阵判定，并给每个组合附同一条
+                        # 最短依赖路径（路径只取决于依赖图，与选用哪个候选许可证无关）。
+                        entry["multi_license"] = True
+                        entry["ancestor_license_candidates"] = [
+                            str(item["token"]) for item in _node_license_candidates(ancestor_node)
+                        ]
+                        entry["node_license_candidates"] = [
+                            str(item["token"]) for item in _node_license_candidates(dep_node)
+                        ]
+                        for combo in combinations:
+                            combo["path"] = path
+                            combo["distance"] = len(path) - 1
+                        entry["combinations"] = combinations
+                    conflicts.append(entry)
+                if _node_imposes_constraint(ancestor_node):
                     nodes[nxt]["constraints"].append(
                         {
                             "from": ancestor,
-                            "license": nodes[ancestor]["license_display"],
-                            "category": nodes[ancestor]["license_category"],
+                            "license": ancestor_node["license_display"],
+                            "category": ancestor_node["license_category"],
                             "distance": _distance_to(parents, ancestor, nxt),
                             "status": status,
                         }

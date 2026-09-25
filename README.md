@@ -7,6 +7,14 @@ manifest（或直接上传 **CycloneDX JSON** SBOM），系统会：
    映射为规范 SPDX 标识，合并重复节点并归一依赖边；
 2. **计算传递约束** —— 按内置许可证兼容矩阵（宽松型 / 弱 copyleft / 强 copyleft / 专有），
    对依赖图做传递可达性分析，记录每个节点受到的来自所有祖先的许可证约束；
+   许可证支持 `MIT OR GPL-2.0` 这类**多许可证候选**（见第 2b 节）；
+2b. **多许可证候选（OR）组合判定** —— 原生 manifest 的 `license` 与 CycloneDX
+   组件的 `licenses` 中，仅由矩阵内许可证标识以 `OR` 连接的表达式（多个并列
+   许可证条目按 CycloneDX 选择语义以 ` OR ` 连接，同样处理）会被识别为候选
+   集合；祖先与依赖各有候选时，对两侧候选做笛卡尔组合**逐一调用兼容矩阵**：
+   **全部组合冲突才报硬冲突，全部组合兼容才判通过，其余报需人工确认**，并在
+   冲突/告警中以表格列出每个组合的矩阵判定、判定理由与原最短路径。含 `AND`、
+   括号或任一未知标识的表达式仍按未知处理（需人工确认），单许可证结果语义不变；
 3. **标出最短冲突路径** —— 对每一对不兼容的“祖先许可证 → 后代许可证”，用 BFS 给出
    **最短依赖路径**（冲突路径上每个节点都标注许可证），硬冲突与“需人工确认”告警分级展示；
 4. **按包筛选** —— 包名子串过滤，凡最短路径经过该包的冲突都会保留；
@@ -139,6 +147,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 无法解析到已声明节点的依赖会进入 `unresolved` 列表并产生告警，不会凭空造节点；
 - 未在矩阵中识别的许可证（如 `OFL-1.1`）保留原文并标记为 unknown，
   相关边按“需人工确认”告警处理，而非误判为兼容；
+- **多许可证候选（OR）**：`license` 可以写 `MIT OR GPL-2.0` 这类仅由矩阵内
+  标识以 `OR` 连接的表达式（大小写不敏感），节点会标记为「多许可证候选（OR）」
+  并保留各候选；祖先与依赖各有候选时，对候选组合逐一调用兼容矩阵——
+  全部冲突才报硬冲突、全部兼容才判通过，其余报需人工确认，冲突/告警中列出
+  各组合判定与原最短路径。含 `AND`、括号或未知标识（如
+  `Apache-2.0 WITH LLVM-exception`、`MIT OR OFL-1.1`）的表达式不做候选
+  判定，仍按未知处理；单许可证的判定语义完全不变；
 - 依赖环会被安全处理（BFS 节点只访问一次），不影响最短路径计算。
 
 ## CycloneDX JSON（SBOM）导入
@@ -186,11 +201,15 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   的依赖边，随后复用同一套兼容矩阵与最短路径冲突分析；
 - **许可证**：取组件 `licenses` 中的 SPDX `id` 或 `expression`（兜底取
   `license.name`，同样走别名规范化）；多个并列 id/name 按 CycloneDX 的选择语义
-  以 ` OR ` 连接（通常会落入 unknown，交由人工确认）；**缺失许可证按未知处理**
-  （显示为 `UNLICENSED`，相关边按“需人工确认”告警）；
+  以 ` OR ` 连接——只要各标识（或 `expression` 本身，如 `MIT OR GPL-2.0`）
+  都在兼容矩阵内，就作为**多许可证候选**与原生 manifest 的 OR 表达式同源处理
+  （候选组合逐一判定：全冲突→硬冲突、全兼容→通过、其余→需人工确认）；
+  含未知标识 / `AND` / 括号时仍落入 unknown，交由人工确认；**缺失许可证按
+  未知处理**（显示为 `UNLICENSED`，相关边按“需人工确认”告警）；
 - **422（不静默合并）**：同一 `bom-ref` 重复出现，或同名同版本组件对应不同许可证
-  （按规范化后的标识比较，`MIT` 与 `MIT License` 视为相同）时，返回明确的
-  `422` 错误并中止导入，需修正 BOM 后重新提交；
+  （多许可证候选按规范化后的候选标识**集合**比较，与并列顺序无关；`MIT` 与
+  `MIT License` 视为相同）时，返回明确的 `422` 错误并中止导入，需修正 BOM
+  后重新提交；
 - **未解析引用**：`dependencies` 中引用了不存在于 `components` 的 bom-ref 时，
   对应条目进入 `unresolved` 列表并产生告警，不会凭空造节点；
 - 结果与原生 manifest 完全一致地进入历史列表、参与两次审计对比、按包筛选与导出，
@@ -691,7 +710,7 @@ manifest 摘要、保存结果摘要与分析器复算三项校验结果，未�
   "nodes": [
     { "id": "pdf-export@4.0.0", "name": "pdf-export", "version": "4.0.0",
       "license_display": "Apache 2.0", "license": "Apache-2.0",
-      "license_category": "permissive",
+      "license_category": "permissive", "license_candidates": null,
       "constraints": [ { "from": "billing-core@1.2.0", "license": "GPL-2.0", "distance": 1, "status": "conflict" } ] }
   ],
   "conflicts": [
@@ -712,6 +731,60 @@ manifest 摘要、保存结果摘要与分析器复算三项校验结果，未�
 
 CycloneDX 导入的审计结果结构相同，另带 `"source_format": "cyclonedx"` 标识，
 且每个节点多一个 `bom_refs` 字段记录映射到该节点的组件 bom-ref。
+
+### 多许可证候选（OR）的节点与冲突结构
+
+当某节点的许可证是矩阵内标识以 `OR` 连接的表达式（原生 manifest 的
+`"license": "GPL-2.0 OR GPL-3.0"`，或 CycloneDX 组件的多个并列许可证
+条目）时，节点的 `license_category` 为 `multi-license`，`license` 为候选
+标识以 ` OR ` 连接的稳定形式，`license_candidates` 给出各候选明细：
+
+```json
+{
+  "id": "app@1.0.0", "license_display": "GPL-2.0 OR GPL-3.0",
+  "license": "GPL-2.0 OR GPL-3.0", "license_known": true,
+  "license_category": "multi-license",
+  "license_candidates": [
+    {"display": "GPL-2.0", "token": "GPL-2.0", "known": true, "category": "strong-copyleft"},
+    {"display": "GPL-3.0", "token": "GPL-3.0", "known": true, "category": "strong-copyleft"}
+  ]
+}
+```
+
+祖先与依赖两侧候选（单许可证视为仅含一个候选）做笛卡尔组合逐一调用兼容
+矩阵，产出的冲突/告警条目额外带 `multi_license: true`、两侧候选标识列表
+与 `combinations`：每个组合给出双方许可证、矩阵 `status`（`ok` /
+`conflict` / `warning`）、`severity`、判定理由及该条约束的**原最短路径**
+（路径只取决于依赖图，与选用哪个候选无关）。条目的整体 `severity` 按
+**全部 conflict → `error`、全部 ok → 不产出条目、其余 → `warning`** 聚合：
+
+```json
+{
+  "id": "C002", "severity": "warning", "multi_license": true,
+  "ancestor": "app@1.0.0", "node": "web-ui@1.4.2",
+  "ancestor_license": "GPL-2.0 OR GPL-3.0", "node_license": "Apache-2.0",
+  "ancestor_license_candidates": ["GPL-2.0", "GPL-3.0"],
+  "node_license_candidates": ["Apache-2.0"],
+  "distance": 1, "path": ["app@1.0.0", "web-ui@1.4.2"],
+  "reason": "多许可证候选共 2 种组合：1 种兼容、1 种冲突、0 种需人工确认；…需要人工确认。",
+  "combinations": [
+    {"ancestor_license": "GPL-2.0", "ancestor_token": "GPL-2.0",
+     "node_license": "Apache-2.0", "node_token": "Apache-2.0",
+     "status": "conflict", "severity": "error",
+     "reason": "GPL-2.0 与 Apache-2.0 专利条款冲突…",
+     "distance": 1, "path": ["app@1.0.0", "web-ui@1.4.2"]},
+    {"ancestor_license": "GPL-3.0", "ancestor_token": "GPL-3.0",
+     "node_license": "Apache-2.0", "node_token": "Apache-2.0",
+     "status": "ok", "severity": "ok",
+     "reason": "GPL-3.0 明确兼容宽松许可证（含 Apache-2.0）。",
+     "distance": 1, "path": ["app@1.0.0", "web-ui@1.4.2"]}
+  ]
+}
+```
+
+含 `AND`、括号或任一未知标识的表达式不会产生候选：节点 `license_known`
+为 `false`、`license_candidates` 为 `null`，相关约束沿用 unknown 语义
+报“需人工确认”，条目不含上述多许可证字段。
 
 ## 兼容矩阵说明（方向：父作品许可证 → 依赖许可证）
 
@@ -752,7 +825,7 @@ CycloneDX 导入的审计结果结构相同，另带 `"source_format": "cycloned
 ├── static/
 │   ├── index.html     # 单文件网页（无外部 CDN 依赖）
 │   └── examples/      # sample-manifest.json 与 sample-cyclonedx.json 两个内置示例
-├── tests/             # 轻量自测：python -m tests.test_analyzer / test_compare / test_reviews / test_cyclonedx / test_retire / test_relicense / test_edgefix / test_edgecut / test_repro
+├── tests/             # 轻量自测：python -m tests.test_analyzer / test_compare / test_reviews / test_cyclonedx / test_multilic / test_retire / test_relicense / test_edgefix / test_edgecut / test_repro
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

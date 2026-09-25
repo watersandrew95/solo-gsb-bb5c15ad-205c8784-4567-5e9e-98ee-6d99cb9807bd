@@ -9,13 +9,21 @@
     强 copyleft : GPL-2.0, GPL-3.0, AGPL-3.0
     专有 : Proprietary
 
+多许可证候选：仅由矩阵内许可证标识以 ``OR`` 连接的表达式（如
+``MIT OR GPL-2.0``，以及 CycloneDX 中多个并列许可证条目）会被识别为
+*候选集合*——使用方可以选择其中任一许可证，分析时对祖先/依赖两侧的候选
+做笛卡尔组合逐一判定：全部冲突才是硬冲突，全部兼容才判通过，其余报
+需人工确认。含 ``AND``、括号或任何矩阵外未知标识的表达式仍按未知处理；
+单许可证的判定语义完全不变。
+
 未识别的许可证一律保留原文并标记 unknown，按“需人工确认”告警处理。
 """
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # --- 许可证元数据 -----------------------------------------------------------
 
@@ -24,6 +32,8 @@ WEAK_COPYLEFT = "weak-copyleft"
 STRONG_COPYLEFT = "strong-copyleft"
 PROPRIETARY = "proprietary"
 UNKNOWN = "unknown"
+# 多许可证候选（矩阵内标识以 OR 连接）的节点分类；不参与兼容矩阵
+MULTI_LICENSE = "multi-license"
 
 CATEGORIES: Dict[str, str] = {
     "MIT": PERMISSIVE,
@@ -48,6 +58,7 @@ CATEGORY_LABELS: Dict[str, str] = {
     STRONG_COPYLEFT: "强 Copyleft",
     PROPRIETARY: "专有",
     UNKNOWN: "未知",
+    MULTI_LICENSE: "多许可证候选（OR）",
 }
 
 CATEGORY_NOTES: Dict[str, str] = {
@@ -56,6 +67,7 @@ CATEGORY_NOTES: Dict[str, str] = {
     STRONG_COPYLEFT: "强 copyleft：整体派生作品须以同一许可证开源，排斥专有代码。",
     PROPRIETARY: "专有许可证，不允许自由再分发/修改，能否使用需逐项确认。",
     UNKNOWN: "未在矩阵中识别，无法自动判定兼容性，需要人工确认。",
+    MULTI_LICENSE: "多个许可证以 OR 并列（使用方可任选其一），按候选组合逐一判定兼容性。",
 }
 
 # 规范标识的小写形式 -> 规范标识（gpl-2.0 -> GPL-2.0 等）
@@ -164,6 +176,45 @@ def normalize_license(raw: object) -> Tuple[str, str, bool]:
     if not text:
         return display, "unlicensed", False
     return display, key.replace(" ", "_"), False
+
+
+# OR 连接符（大小写不敏感，两侧需有空白，避免误判含 "or" 的许可证名）
+_OR_SPLIT_RE = re.compile(r"\s+OR\s+", re.IGNORECASE)
+
+
+def parse_or_candidates(raw: object) -> Optional[List[Dict[str, object]]]:
+    """解析由矩阵内许可证标识以 ``OR`` 连接的多许可证候选表达式。
+
+    仅当表达式整体不含 ``AND`` / 括号、且按 ``OR`` 切分后的**每一项**都能
+    规范化为内置矩阵中的已知许可证时，返回候选列表（每项为
+    :func:`license_info` 同结构字典，按出现顺序去重）；其余情况（含
+    ``AND``、括号、空项或任一未知标识）一律返回 ``None``，调用方按
+    未知许可证处理。单许可证表达式（没有 ``OR``）也返回 ``None``，
+    单许可证语义仍走 :func:`normalize_license`。
+    """
+    text = "" if raw is None else str(raw).strip()
+    if not text:
+        return None
+    # 含 AND 或括号的表达式不做多候选判定（嵌套/合取语义交由人工确认）
+    if re.search(r"\bAND\b", text, re.IGNORECASE) or "(" in text or ")" in text:
+        return None
+    parts = _OR_SPLIT_RE.split(text)
+    if len(parts) < 2:
+        return None
+    candidates: List[Dict[str, object]] = []
+    seen_tokens: set = set()
+    for part in parts:
+        piece = part.strip()
+        if not piece:
+            return None  # 形如 "MIT OR" 的残缺表达式
+        info = license_info(piece)
+        if not info["known"]:
+            return None  # 任一候选不在矩阵内：整体按未知处理
+        token = str(info["token"])
+        if token not in seen_tokens:
+            seen_tokens.add(token)
+            candidates.append(info)
+    return candidates or None
 
 
 # --- 兼容性判定 -------------------------------------------------------------
@@ -321,9 +372,28 @@ def build_matrix() -> List[Dict[str, object]]:
 
 
 def license_info(raw: object) -> Dict[str, object]:
-    """规范化许可证并返回富信息字典。"""
+    """规范化许可证并返回富信息字典。
+
+    当原文是矩阵内标识以 ``OR`` 连接的候选表达式（或 CycloneDX 多个并列
+    许可证条目拼接成的同类表达式）时：
+
+    * ``license_candidates`` 为各候选的规范信息列表，``token`` 为
+      候选标识以 `` OR `` 连接的稳定形式（用于指纹与对比），
+      ``category`` 为 :data:`MULTI_LICENSE`，``known`` 为 ``True``；
+    * 含 ``AND``、括号或未知标识的表达式 ``license_candidates`` 为 ``None``，
+      仍按未知处理；单许可证 ``license_candidates`` 同样为 ``None``。
+    """
     display, token, known = normalize_license(raw)
-    category = CATEGORIES.get(token, UNKNOWN)
+    candidates = parse_or_candidates(raw) if not known else None
+    if candidates is not None:
+        # 规范 token 按候选标识排序，使 "MIT OR GPL-2.0" 与 "GPL-2.0 OR MIT"
+        # 归一为同一身份（OR 可交换）；展示与组合判定仍保留原文候选顺序。
+        token = " OR ".join(sorted(str(item["token"]) for item in candidates))
+        category = MULTI_LICENSE
+        known = True
+        display = "" if raw is None else str(raw).strip()
+    else:
+        category = CATEGORIES.get(token, UNKNOWN)
     return {
         "raw": "" if raw is None else str(raw),
         "display": display,
@@ -332,4 +402,5 @@ def license_info(raw: object) -> Dict[str, object]:
         "category": category,
         "category_label": CATEGORY_LABELS[category],
         "note": CATEGORY_NOTES[category],
+        "license_candidates": candidates,
     }

@@ -29,6 +29,11 @@
       "dependencies": ["font-pack@2.0.0"]
     },
     { "name": "font-pack", "version": "2.0.0", "license": "OFL-1.1" },
+    {
+      "name": "dual-licensed-util",
+      "version": "1.0.0",
+      "license": "MIT OR GPL-2.0"
+    },
     { "name": "crypto-lib", "version": "1.1.0", "license": "Apache-2.0" },
     { "name": "legacy-math", "version": "0.3.0", "license": "GPL-3.0" },
     {
@@ -63,6 +68,7 @@
   ],
   "edges": [
     { "source": "web-app@2.1.0", "target": "reports@0.5.0", "type": "optional" },
-    { "source": "billing-core@1.2.0", "target": "@org/logger@3.0.0" }
+    { "source": "billing-core@1.2.0", "target": "@org/logger@3.0.0" },
+    { "source": "admin-cli@1.4.0", "target": "dual-licensed-util@1.0.0" }
   ]
 }

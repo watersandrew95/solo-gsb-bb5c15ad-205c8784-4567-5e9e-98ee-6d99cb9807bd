@@ -369,6 +369,12 @@ def analyze_cut(result: Dict[str, Any], conflict_id: str) -> Dict[str, Any]:
             "node_license": conflict.get("node_license"),
             "distance": conflict.get("distance"),
             "reason": conflict.get("reason"),
+            # 多许可证候选（OR）条目的组合判定与候选列表随快照一并返回，
+            # 供页面展示（最少断边只取决于图，与选用哪个候选许可证无关）
+            "multi_license": conflict.get("multi_license", False),
+            "ancestor_license_candidates": conflict.get("ancestor_license_candidates"),
+            "node_license_candidates": conflict.get("node_license_candidates"),
+            "combinations": conflict.get("combinations"),
         },
         "source": source,
         "target": target,

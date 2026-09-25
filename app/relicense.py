@@ -134,6 +134,8 @@ def _recompute_with_license(
     target["license"] = info["token"]
     target["license_known"] = True
     target["license_category"] = info["category"]
+    # 替换为单个候选 SPDX 许可证后，该节点不再是 OR 多许可证候选
+    target["license_candidates"] = None
 
     edges = copy.deepcopy(result.get("edges", []) or [])
     unresolved = copy.deepcopy(result.get("unresolved", []) or [])

@@ -10,7 +10,10 @@
 * 每个 ``components[]`` 组件规范化为一个包节点（``name@version``），组件的
   ``bom-ref`` 记录到节点的 ``bom_refs`` 字段，并建立 ``bom-ref -> 节点`` 映射；
 * 组件许可证取 ``licenses`` 中的 SPDX ``id`` 或 ``expression``
-  （兜底取 ``license.name``），缺失许可证按未知（UNLICENSED）处理；
+  （兜底取 ``license.name``）；多个并列 id/name 按 CycloneDX 的选择语义
+  用 `` OR `` 连接——只要各标识（或 ``expression`` 本身）都在兼容矩阵内，
+  就作为**多许可证候选**参与组合判定（与原生 manifest 的 OR 表达式同源）；
+  缺失许可证按未知（UNLICENSED）处理；
 * ``dependencies[]`` 按 ``ref`` / ``dependsOn`` 还原依赖边（方向：使用方 -> 被依赖方），
   引用不到任何组件 bom-ref 的条目保留为未解析告警，不凭空造节点；
 * 为避免静默合并，以下情况直接判定为解析错误（API 层返回 422）：
@@ -104,7 +107,7 @@ def analyze_bom(bom: Dict[str, Any], manifest_name: str = "uploaded-manifest") -
 
         existing = nodes.get(nid)
         if existing is not None:
-            if existing["license"] != info["token"]:
+            if _license_identity(existing) != _license_identity_from_info(info):
                 return _error_result(
                     display_name,
                     "组件 %s 被多次声明且许可证不一致（%s vs %s）。为避免静默合并，"
@@ -127,6 +130,7 @@ def analyze_bom(bom: Dict[str, Any], manifest_name: str = "uploaded-manifest") -
             "license": info["token"],
             "license_known": info["known"],
             "license_category": info["category"],
+            "license_candidates": info.get("license_candidates"),
             "bom_refs": [bom_ref] if bom_ref else [],
             "constraints": [],
             "conflict_count": 0,
@@ -202,12 +206,33 @@ def _display_name(bom: Dict[str, Any], manifest_name: str) -> str:
     return name or str(manifest_name).strip() or "cyclonedx-bom"
 
 
+def _license_identity(node: Dict[str, Any]) -> Tuple[str, ...]:
+    """节点许可证的稳定身份：多许可证候选按候选标识集合（排序后）比较。
+
+    并列条目以不同顺序出现仍视为同一许可证；单许可证退化为单元素元组。
+    """
+    candidates = node.get("license_candidates")
+    if candidates:
+        return tuple(sorted(str(item.get("token")) for item in candidates))
+    return (str(node.get("license")),)
+
+
+def _license_identity_from_info(info: Dict[str, Any]) -> Tuple[str, ...]:
+    """``licenses.license_info`` 产物的稳定身份（与 :func:`_license_identity` 对齐）。"""
+    candidates = info.get("license_candidates")
+    if candidates:
+        return tuple(sorted(str(item.get("token")) for item in candidates))
+    return (str(info.get("token")),)
+
+
 def _extract_license(component: Dict[str, Any], warn) -> Optional[str]:
     """从组件的 ``licenses`` 数组提取许可证文本。
 
-    优先级：SPDX ``id`` > ``expression`` > ``license.name``；
-    多个并列 id/name 按 CycloneDX 的选择语义用 `` OR `` 连接（通常会落入
-    unknown，交由人工确认）。缺失或结构无法识别时返回 ``None``（按未知处理）。
+    优先级：SPDX ``id`` > ``expression`` > ``license.name``；取第一个非空
+    分组，组内多个并列条目按 CycloneDX 的选择语义用 `` OR `` 连接。
+    连接后的表达式交给 ``licenses`` 解析：各标识都在矩阵内时识别为
+    **多许可证候选**（参与组合逐一判定），含未知标识/AND/括号时仍按
+    未知处理，交由人工确认。缺失或结构无法识别时返回 ``None``。
     """
     raw = component.get("licenses")
     if raw is None:

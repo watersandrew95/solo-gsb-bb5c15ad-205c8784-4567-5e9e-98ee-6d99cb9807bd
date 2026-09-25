@@ -64,6 +64,7 @@
   .badge.cat-strong-copyleft { background: var(--err-bg); color: var(--err); }
   .badge.cat-proprietary { background: #f3ecfd; color: #6b32b8; }
   .badge.cat-unknown { background: var(--warn-bg); color: var(--warn); }
+  .badge.cat-multi-license { background: #e7f0fb; color: var(--brand-dark); }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { color: var(--muted); font-weight: 600; font-size: 12px; }
@@ -137,6 +138,17 @@
   .edgecut-witness { font-size: 12px; }
   .badge.reach-no { background: var(--ok-bg); color: var(--ok); }
   .badge.reach-yes { background: var(--err-bg); color: var(--err); }
+  .combo-wrap { margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .combo-wrap table { font-size: 12px; }
+  .combo-wrap th { background: #f4f7fb; }
+  .combo-wrap td, .combo-wrap th { padding: 7px 10px; }
+  .combo-status { white-space: nowrap; }
+  .combo-status .badge { font-size: 11px; }
+  .combo-reason { color: var(--muted); }
+  .combo-paths { margin-top: 6px; }
+  .combo-paths .path-label { margin-top: 4px; }
+  .candidate-note { font-size: 11px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
+  .candidate-note .pill { margin: 0 3px 3px 0; display: inline-block; }
 </style>
 </head>
 <body>
@@ -160,7 +172,7 @@
       </label>
       <button class="secondary" id="btn-sample">载入示例</button>
       <button class="secondary" id="btn-sample-cdx">载入 CycloneDX 示例</button>
-      <span class="hint">依赖边方向：使用方 → 被依赖方；支持 packages / dependencies / edges 混合声明，也可直接粘贴或上传 CycloneDX JSON（自动识别 bomFormat / components / dependencies，按 bom-ref 还原依赖图）。</span>
+      <span class="hint">依赖边方向：使用方 → 被依赖方；支持 packages / dependencies / edges 混合声明，也可直接粘贴或上传 CycloneDX JSON（自动识别 bomFormat / components / dependencies，按 bom-ref 还原依赖图）。许可证支持 <b>MIT OR GPL-2.0</b> 这类 OR 候选表达式（CycloneDX 多个并列许可证条目同理）：两侧候选会逐一组合判定，全部冲突才报硬冲突、全部兼容判通过，其余需人工确认；含 AND、括号或未知标识的表达式仍按未知处理。</span>
     </div>
   </section>
 
@@ -287,6 +299,8 @@
       <div class="hint" style="margin-bottom:10px;">
         复核标记按「祖先节点 + 被依赖节点 + 双方规范化许可证」生成指纹，跨审计生效：
         同一冲突在任意历史审计中重现都会带出同一条标记；许可证变更、标记过期或撤销后自动回到待复核。
+        <b>多许可证候选（OR）</b>条目会在下方表格逐一列出祖先/依赖候选的每种组合调用兼容矩阵的判定与原最短路径：
+        全部组合冲突才是硬冲突，全部兼容则判通过，其余报需人工确认。
         每条冲突还可做<b>最少断边分析</b>：沿现有 使用方→被依赖方 图求让祖先包无法再到达被依赖包所需删除的
         <b>最少依赖边</b>（并行路径、汇合路径与环均纳入计算，不只看当前最短路径），展示原最短路径、建议断边与断边后可达性。
       </div>
@@ -395,13 +409,62 @@ function renderConflicts(result) {
         <span class="badge ${c.severity === "error" ? "conflict" : "warning"}">${c.severity === "error" ? "硬冲突" : "需人工确认"}</span>
         ${reviewBadge(c)}
         <span class="mono"><b>${esc(c.ancestor)}</b> ── ${esc(c.ancestor_license)} → ${esc(c.node_license)} ── <b>${esc(c.node)}</b></span>
+        ${c.multi_license ? '<span class="pill">多许可证候选 · ' + c.combinations.length + ' 种组合</span>' : ""}
         <span class="pill">最短路径 ${c.distance} 跳 · ${c.id}</span>
       </div>
       <div class="reason">${esc(c.reason)}</div>
       <div class="path">${renderPath(c.path)}</div>
+      ${renderCombinations(c, (currentResult.nodes || []))}
       ${reviewBox(c)}
       ${edgecutBox(c)}
     </div>`).join("");
+}
+
+// --- 多许可证候选组合判定 -------------------------------------------------------
+
+function comboStatusBadge(sev) {
+  if (sev === "error" || sev === "conflict") return '<span class="badge conflict">冲突</span>';
+  if (sev === "warning") return '<span class="badge warning">需人工确认</span>';
+  return '<span class="badge clean">兼容</span>';
+}
+
+function renderComboPath(path, nodeList) {
+  // 组合的最短路径只取决于依赖图；若节点表（筛选后）缺路径节点则仅渲染 id
+  const nodes = nodeList || [];
+  return '<div class="path">' + path.map((nid) => {
+    const node = nodes.find((n) => n.id === nid);
+    const lic = node ? node.license_display : "";
+    return esc(nid) + (lic ? ' <span class="muted">[' + esc(lic) + ']</span>' : "");
+  }).join('<span class="arrow">→</span>') + "</div>";
+}
+
+function renderCombinations(c, nodeList) {
+  if (!c || !c.multi_license || !c.combinations || !c.combinations.length) return "";
+  const counts = c.combinations.reduce((acc, cmb) => {
+    acc[cmb.severity] = (acc[cmb.severity] || 0) + 1;
+    return acc;
+  }, {});
+  const summary = '（兼容 ' + (counts.ok || 0) + ' · 冲突 ' + (counts.error || 0) +
+    ' · 需人工确认 ' + (counts.warning || 0) + '；全部冲突才报硬冲突，全部兼容则判通过，其余需人工确认）';
+  const rows = c.combinations.map((cmb) =>
+    "<tr><td class='mono'>" + esc(cmb.ancestor_license) + "</td>" +
+    "<td class='combo-status'>" + comboStatusBadge(cmb.severity) + "</td>" +
+    "<td class='mono'>" + esc(cmb.node_license) + "</td>" +
+    "<td class='combo-reason'>" + esc(cmb.reason) + "</td></tr>"
+  ).join("");
+  // 各组合的原最短路径（路径由依赖图决定，与选用哪个候选无关），折叠展示
+  const paths = '<details class="combo-paths"><summary>查看各组合的原最短依赖路径（' +
+    c.combinations.length + ' 条，均为同一条图上最短路径）</summary>' +
+    c.combinations.map((cmb, i) =>
+      '<div class="path-label"><span class="pill">组合 #' + (i + 1) + " · " +
+      esc(cmb.ancestor_license) + " → " + esc(cmb.node_license) + " · " + (cmb.distance) +
+      " 跳</span> " + comboStatusBadge(cmb.severity) + "</div>" +
+      renderComboPath(cmb.path || c.path, nodeList)
+    ).join("") + "</details>";
+  return '<details class="combo-wrap" style="margin-top:10px;"><summary style="padding:8px 10px;background:#f4f7fb;">🧾 候选组合逐一判定 ' +
+    '<span class="hint">' + summary + "</span></summary>" +
+    '<table><thead><tr><th>祖先候选许可证</th><th>矩阵判定</th><th>依赖候选许可证</th><th>判定理由</th></tr></thead>' +
+    "<tbody>" + rows + "</tbody></table>" + paths + "</details>";
 }
 
 // --- 最少断边分析 -------------------------------------------------------------
@@ -468,6 +531,11 @@ function renderEdgecutResult(conflictId, d) {
       ? '<span class="badge reach-yes">仍可达（异常）</span>'
       : '<span class="badge reach-no">已不可达 ✓</span>') +
     "</div>";
+
+  // 多许可证候选条目：最少断边只取决于图，但组合判定仍随快照展示
+  if (d.conflict.multi_license) {
+    html += renderCombinations(d.conflict, (currentResult.nodes || []));
+  }
 
   // 原最短路径（标红落在上面的建议断边）
   html += '<div class="path-label"><span class="tag base">原审计</span>原最短依赖路径（' +
@@ -605,10 +673,17 @@ function renderNodes(result) {
     const cons = (n.constraints || []).map((c) =>
       `<div class="mono" style="font-size:12px;">${esc(c.from)} <span class="muted">(${esc(c.license)}, ${c.distance} 跳)</span></div>`
     ).join("") || '<span class="muted">无</span>';
+    let licenseCell = '<span class="badge ' + catClass(n.license_category) + '">' + esc(n.license_display) + "</span>";
+    if (n.license_candidates && n.license_candidates.length > 1) {
+      licenseCell += '<div class="candidate-note">OR 候选（使用方可任选其一）：' +
+        n.license_candidates.map((c) =>
+          '<span class="pill">' + esc(c.display || c.token) + "</span>"
+        ).join("") + "</div>";
+    }
     return `<tr>
       <td class="mono">${esc(n.name)}</td>
       <td class="mono">${n.version_unspecified ? '<span class="muted">未指定</span>' : esc(n.version)}</td>
-      <td><span class="badge ${catClass(n.license_category)}">${esc(n.license_display)}</span></td>
+      <td>${licenseCell}</td>
       <td>${cons}</td>
       <td>${n.conflict_count ? '<b style="color:var(--err)">' + n.conflict_count + '</b>' : '0'}</td>
     </tr>`;
@@ -807,9 +882,13 @@ function renderFindingsBox(title, list) {
       fields = '<div class="fields-changed">变化项：' + esc(labels) + "</div>";
     }
     const reason = present.reason ? '<div class="reason">' + esc(present.reason) + "</div>" : "";
+    // 多许可证候选：展示存在侧（added=目标侧、removed=基准侧、changed=目标侧）的组合判定
+    const comboSide = f.target ? "target" : "base";
+    const comboNodes = Object.values(window.__cmpNodeMaps[comboSide] || {});
+    const combos = renderCombinations(present, comboNodes);
     return '<div class="conflict ' + (present.severity === "error" ? "error" : "warning") + '">' +
       '<div class="head">' + head + findingTitle(f) + "</div>" +
-      fields + reason + paths.join("") + "</div>";
+      fields + reason + combos + paths.join("") + "</div>";
   }).join("");
   return "<h3 style='margin:16px 0 8px;font-size:14px;'>" + esc(title) +
     ' <span class="pill">' + list.length + " 条</span></h3>" + rows;
@@ -1109,6 +1188,7 @@ function renderRetireResult(data) {
       '<span class="mono"><b>' + esc(c.ancestor) + "</b> ── " + esc(c.ancestor_license) + " → " + esc(c.node_license) + " ── <b>" + esc(c.node) + "</b></span>" +
       '<span class="pill">原最短路径 ' + c.distance + " 跳 · " + esc(c.id) + "</span></div>" +
       '<div class="reason">' + esc(c.reason) + "</div>" +
+      renderCombinations(c, Object.values(retireNodeMap)) +
       renderRetirePath(c.path) +
       "</div>"
     ).join("");
