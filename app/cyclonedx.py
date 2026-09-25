@@ -9,8 +9,9 @@
 
 * 每个 ``components[]`` 组件规范化为一个包节点（``name@version``），组件的
   ``bom-ref`` 记录到节点的 ``bom_refs`` 字段，并建立 ``bom-ref -> 节点`` 映射；
-* 组件许可证取 ``licenses`` 中的 SPDX ``id`` 或 ``expression``
-  （兜底取 ``license.name``），缺失许可证按未知（UNLICENSED）处理；
+* 组件许可证取 ``licenses`` 中的 SPDX ``id``、``expression`` 或兜底 ``license.name``；
+  纯 `` OR `` 表达式与多个并列许可证条目解析为**多许可证候选**，含 AND、括号或
+  未知标识的表达式仍按未知处理，缺失许可证按未知（UNLICENSED）处理；
 * ``dependencies[]`` 按 ``ref`` / ``dependsOn`` 还原依赖边（方向：使用方 -> 被依赖方），
   引用不到任何组件 bom-ref 的条目保留为未解析告警，不凭空造节点；
 * 为避免静默合并，以下情况直接判定为解析错误（API 层返回 422）：
@@ -89,7 +90,7 @@ def analyze_bom(bom: Dict[str, Any], manifest_name: str = "uploaded-manifest") -
             continue
         version, _ = analyzer.clean_version(component.get("version"))
         nid = analyzer.node_id(name, version)
-        info = lic.license_info(_extract_license(component, warn))
+        info = lic.parse_license_entries(_extract_license(component, warn))
 
         bom_ref = component.get("bom-ref")
         bom_ref = str(bom_ref).strip() if bom_ref is not None else ""
@@ -104,7 +105,13 @@ def analyze_bom(bom: Dict[str, Any], manifest_name: str = "uploaded-manifest") -
 
         existing = nodes.get(nid)
         if existing is not None:
-            if existing["license"] != info["token"]:
+            new_tokens = sorted(
+                str(item.get("token"))
+                for item in info.get("candidates", [])
+                if item.get("known")
+            ) or [str(info.get("token"))]
+            old_tokens = sorted(analyzer.license_tokens(existing))
+            if old_tokens != new_tokens or bool(existing["license_known"]) != bool(info["known"]):
                 return _error_result(
                     display_name,
                     "组件 %s 被多次声明且许可证不一致（%s vs %s）。为避免静默合并，"
@@ -117,20 +124,9 @@ def analyze_bom(bom: Dict[str, Any], manifest_name: str = "uploaded-manifest") -
                 ref_map[bom_ref] = nid
             continue
 
-        nodes[nid] = {
-            "id": nid,
-            "name": name,
-            "version": version,
-            "version_unspecified": version == analyzer.UNVERSIONED,
-            "license_raw": info["raw"],
-            "license_display": info["display"],
-            "license": info["token"],
-            "license_known": info["known"],
-            "license_category": info["category"],
-            "bom_refs": [bom_ref] if bom_ref else [],
-            "constraints": [],
-            "conflict_count": 0,
-        }
+        nodes[nid] = analyzer._node_from_info(
+            nid, name, version, info, {"bom_refs": [bom_ref] if bom_ref else []}
+        )
         order.append(nid)
         if bom_ref:
             ref_map[bom_ref] = nid
@@ -202,12 +198,16 @@ def _display_name(bom: Dict[str, Any], manifest_name: str) -> str:
     return name or str(manifest_name).strip() or "cyclonedx-bom"
 
 
-def _extract_license(component: Dict[str, Any], warn) -> Optional[str]:
-    """从组件的 ``licenses`` 数组提取许可证文本。
+def _extract_license(component: Dict[str, Any], warn) -> Optional[List[Dict[str, Any]]]:
+    """提取组件的 ``licenses`` 数组（保留并列条目结构）。
 
-    优先级：SPDX ``id`` > ``expression`` > ``license.name``；
-    多个并列 id/name 按 CycloneDX 的选择语义用 `` OR `` 连接（通常会落入
-    unknown，交由人工确认）。缺失或结构无法识别时返回 ``None``（按未知处理）。
+    返回值直接交给 :func:`licenses.parse_license_entries`：
+
+    * 每个条目归一为 ``{"id"/"name"/"expression": 文本}``（字符串条目也兼容），
+      SPDX ``id`` / ``expression`` / ``license.name`` 的取值优先级在解析器内统一处理；
+    * 纯 `` OR `` 表达式与多个并列条目会被识别为多许可证候选；
+      含 AND、括号或未知标识的表达式整体按未知处理；
+    * 字段缺失或结构无法识别时返回 ``None``（按 UNLICENSED 未知处理）。
     """
     raw = component.get("licenses")
     if raw is None:
@@ -218,34 +218,13 @@ def _extract_license(component: Dict[str, Any], warn) -> Optional[str]:
             % (component.get("name") or component.get("bom-ref") or "?")
         )
         return None
-
-    ids: List[str] = []
-    expressions: List[str] = []
-    names: List[str] = []
+    entries: List[Dict[str, Any]] = []
     for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        license_obj = entry.get("license")
-        if isinstance(license_obj, dict):
-            spdx_id = str(license_obj.get("id") or "").strip()
-            if spdx_id:
-                ids.append(spdx_id)
-                continue
-            license_name = str(license_obj.get("name") or "").strip()
-            if license_name:
-                names.append(license_name)
-                continue
-        expression = str(entry.get("expression") or "").strip()
-        if expression:
-            expressions.append(expression)
-
-    for candidates in (ids, expressions, names):
-        unique = list(dict.fromkeys(candidates))
-        if len(unique) == 1:
-            return unique[0]
-        if len(unique) > 1:
-            return " OR ".join(unique)
-    return None
+        if isinstance(entry, str):
+            entries.append({"expression": entry})
+        elif isinstance(entry, dict):
+            entries.append(entry)
+    return entries or None
 
 
 def _error_result(display_name: str, message: str) -> Dict[str, Any]:

@@ -89,6 +89,56 @@ def _add_warning(warnings: List[str], seen: Set[str], message: str) -> None:
         warnings.append(message)
 
 
+def license_tokens(node: Dict[str, Any]) -> List[str]:
+    """取节点的候选许可证 token 列表（多候选为多个矩阵标识，单许可证为一个）。"""
+    tokens = node.get("license_tokens")
+    if isinstance(tokens, list) and tokens:
+        return [str(t) for t in tokens]
+    token = node.get("license")
+    return [str(token)] if token else []
+
+
+def _node_from_info(
+    nid: str,
+    name: str,
+    version: str,
+    info: Dict[str, Any],
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """由许可证富信息字典构造审计节点（analyzer / cyclonedx 共用）。"""
+    candidates = info.get("candidates") or [info]
+    tokens = [str(item.get("token")) for item in candidates if item.get("known")]
+    if not tokens:
+        tokens = [str(info.get("token"))]
+    node: Dict[str, Any] = {
+        "id": nid,
+        "name": name,
+        "version": version,
+        "version_unspecified": version == UNVERSIONED,
+        "license_raw": info["raw"],
+        "license_display": info["display"],
+        "license": info["token"],
+        "license_known": info["known"],
+        "license_category": info["category"],
+        "license_multi": bool(info.get("multi")),
+        "license_candidates": [
+            {
+                "token": item.get("token"),
+                "display": item.get("display"),
+                "category": item.get("category"),
+                "category_label": item.get("category_label"),
+            }
+            for item in candidates
+        ],
+        "license_tokens": tokens,
+        "constraints": [],
+        "conflict_count": 0,
+    }
+    if extra:
+        node.update(extra)
+    return node
+
+
 # --- 解析 manifest ----------------------------------------------------------
 
 
@@ -137,7 +187,7 @@ def analyze_manifest(manifest: Any, manifest_name: str = "uploaded-manifest") ->
         else:
             version, _ = clean_version(pkg.get("version"))
         nid = node_id(name, version)
-        info = lic.license_info(pkg.get("license"))
+        info = lic.parse_license_entries(pkg.get("license"))
         if nid in nodes:
             existing = nodes[nid]
             if existing["license_display"] != info["display"]:
@@ -146,19 +196,7 @@ def analyze_manifest(manifest: Any, manifest_name: str = "uploaded-manifest") ->
                     % (nid, existing["license_display"], info["display"], existing["license_display"])
                 )
             return nid
-        nodes[nid] = {
-            "id": nid,
-            "name": name,
-            "version": version,
-            "version_unspecified": version == UNVERSIONED,
-            "license_raw": info["raw"],
-            "license_display": info["display"],
-            "license": info["token"],
-            "license_known": info["known"],
-            "license_category": info["category"],
-            "constraints": [],
-            "conflict_count": 0,
-        }
+        nodes[nid] = _node_from_info(nid, name, version, info)
         order.append(nid)
         return nid
 
@@ -349,31 +387,58 @@ def _build_result(
                     visited_ancestors.add(nxt)
                     queue.append(nxt)
 
-                ancestor_token = nodes[ancestor]["license"]
-                dep_token = nodes[nxt]["license"]
-                status, reason = lic.compatibility(ancestor_token, dep_token)
+                ancestor_node = nodes[ancestor]
+                dep_node = nodes[nxt]
+                judgment = lic.compatibility_candidates(
+                    license_tokens(ancestor_node), license_tokens(dep_node)
+                )
+                status = judgment["status"]
+                multi_pair = (
+                    len(judgment["parent_candidates"]) > 1
+                    or len(judgment["dep_candidates"]) > 1
+                )
                 if status != lic.OK:
                     path = _reconstruct_path(parents, ancestor, nxt)
-                    conflicts.append(
-                        {
-                            "kind": "license-conflict",
-                            "severity": "error" if status == lic.CONFLICT else "warning",
-                            "status": status,
-                            "ancestor": ancestor,
-                            "node": nxt,
-                            "ancestor_license": nodes[ancestor]["license_display"],
-                            "node_license": nodes[nxt]["license_display"],
-                            "distance": len(path) - 1,
-                            "path": path,
-                            "reason": reason,
+                    conflict: Dict[str, Any] = {
+                        "kind": "license-conflict",
+                        "severity": "error" if status == lic.CONFLICT else "warning",
+                        "status": status,
+                        "ancestor": ancestor,
+                        "node": nxt,
+                        "ancestor_license": ancestor_node["license_display"],
+                        "node_license": dep_node["license_display"],
+                        "ancestor_multi": bool(ancestor_node.get("license_multi")),
+                        "node_multi": bool(dep_node.get("license_multi")),
+                        "distance": len(path) - 1,
+                        "path": path,
+                        "reason": judgment["reason"],
+                    }
+                    if multi_pair:
+                        # 多候选：列出各候选组合的逐条判定，供网页与导出展示
+                        conflict["candidate_combinations"] = judgment["combinations"]
+                        conflict["combination_counts"] = {
+                            "total": len(judgment["combinations"]),
+                            "ok": sum(
+                                1 for item in judgment["combinations"] if item["status"] == lic.OK
+                            ),
+                            "conflict": sum(
+                                1
+                                for item in judgment["combinations"]
+                                if item["status"] == lic.CONFLICT
+                            ),
+                            "warning": sum(
+                                1
+                                for item in judgment["combinations"]
+                                if item["status"] == lic.WARNING
+                            ),
                         }
-                    )
-                if lic.imposes_constraint(ancestor_token):
+                    conflicts.append(conflict)
+                if any(lic.imposes_constraint(token) for token in license_tokens(ancestor_node)):
                     nodes[nxt]["constraints"].append(
                         {
                             "from": ancestor,
-                            "license": nodes[ancestor]["license_display"],
-                            "category": nodes[ancestor]["license_category"],
+                            "license": ancestor_node["license_display"],
+                            "category": ancestor_node["license_category"],
                             "distance": _distance_to(parents, ancestor, nxt),
                             "status": status,
                         }

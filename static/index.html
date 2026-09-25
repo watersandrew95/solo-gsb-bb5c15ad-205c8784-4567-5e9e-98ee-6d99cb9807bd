@@ -64,6 +64,16 @@
   .badge.cat-strong-copyleft { background: var(--err-bg); color: var(--err); }
   .badge.cat-proprietary { background: #f3ecfd; color: #6b32b8; }
   .badge.cat-unknown { background: var(--warn-bg); color: var(--warn); }
+  .badge.cat-multi { background: var(--info-bg); color: var(--info); }
+  .cand-list { margin: 2px 0 0; padding: 0; list-style: none; display: inline-flex; flex-wrap: wrap; gap: 4px; }
+  .cand-list .cand { font-size: 11px; padding: 0 7px; border-radius: 999px; background: #eef2f8; color: var(--brand-dark); font-weight: 600; }
+  .combos { margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .combos summary { padding: 8px 12px; color: var(--brand); font-size: 12px; background: #f8fafc; }
+  .combos table { font-size: 12px; }
+  .combos th, .combos td { padding: 6px 10px; }
+  .combos .st-ok { color: var(--ok); font-weight: 700; }
+  .combos .st-conflict { color: var(--err); font-weight: 700; }
+  .combos .st-warning { color: var(--warn); font-weight: 700; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { color: var(--muted); font-weight: 600; font-size: 12px; }
@@ -142,7 +152,7 @@
 <body>
 <header class="top">
   <h1>🛡️ 许可证依赖冲突审计台</h1>
-  <p>规范化依赖节点 · 支持 CycloneDX SBOM 导入 · 按许可证兼容矩阵计算传递约束 · 标出冲突的最短依赖路径 · 支持按包筛选与 JSON 导出
+  <p>规范化依赖节点 · 支持 CycloneDX SBOM 导入 · 按许可证兼容矩阵计算传递约束 · 支持多许可证候选（OR）组合判定 · 标出冲突的最短依赖路径 · 支持按包筛选与 JSON 导出
     <a href="/docs" target="_blank">API 文档</a><a href="/api/matrix" target="_blank">兼容矩阵</a>
   </p>
 </header>
@@ -285,6 +295,11 @@
       <h2>7. 冲突与最短依赖路径 <span id="review-stats" class="pill" style="font-weight:400;"></span></h2>
       <div id="review-alert" class="alert"></div>
       <div class="hint" style="margin-bottom:10px;">
+        许可证字段为矩阵内标识以 <b>OR</b> 连接的表达式（如 <span class="mono">MIT OR GPL-2.0</span>），
+        或 CycloneDX/原生声明中有<b>多个并列许可证条目</b>时，按<b>多许可证候选</b>处理：
+        祖先与依赖各有候选时对候选组合逐一调用兼容矩阵，<b>全部组合冲突才报硬冲突、全部兼容才不列出</b>，
+        其余（存在可兼容组合但并非全部兼容）列为「需人工确认」，并在卡片中展开每个组合的判定与矩阵理由（附原最短路径）。
+        含 <b>AND</b>、<b>括号</b>或<b>未知标识</b>的表达式不做拆分，仍按未知（需人工确认）处理；单许可证结果与原语义一致。
         复核标记按「祖先节点 + 被依赖节点 + 双方规范化许可证」生成指纹，跨审计生效：
         同一冲突在任意历史审计中重现都会带出同一条标记；许可证变更、标记过期或撤销后自动回到待复核。
         每条冲突还可做<b>最少断边分析</b>：沿现有 使用方→被依赖方 图求让祖先包无法再到达被依赖包所需删除的
@@ -394,14 +409,44 @@ function renderConflicts(result) {
       <div class="head">
         <span class="badge ${c.severity === "error" ? "conflict" : "warning"}">${c.severity === "error" ? "硬冲突" : "需人工确认"}</span>
         ${reviewBadge(c)}
-        <span class="mono"><b>${esc(c.ancestor)}</b> ── ${esc(c.ancestor_license)} → ${esc(c.node_license)} ── <b>${esc(c.node)}</b></span>
+        <span class="mono"><b>${esc(c.ancestor)}</b> ── ${renderLicenseRef(c.ancestor_license, c.ancestor_multi)} → ${renderLicenseRef(c.node_license, c.node_multi)} ── <b>${esc(c.node)}</b></span>
         <span class="pill">最短路径 ${c.distance} 跳 · ${c.id}</span>
       </div>
       <div class="reason">${esc(c.reason)}</div>
       <div class="path">${renderPath(c.path)}</div>
+      ${renderCombinations(c)}
       ${reviewBox(c)}
       ${edgecutBox(c)}
     </div>`).join("");
+}
+
+// --- 多许可证候选 -------------------------------------------------------------
+
+const ST_STATUS_LABEL = { ok: "兼容", conflict: "冲突", warning: "需人工确认" };
+
+function renderLicenseRef(text, multi) {
+  // 冲突抬头里的许可证：多候选加“多候选 N 选 1”提示徽标
+  const label = esc(text);
+  return multi
+    ? '<span class="badge cat-multi" title="OR 选择关系，可任选其一">多候选</span> ' + label
+    : label;
+}
+
+function renderCombinations(c) {
+  const combos = c.candidate_combinations;
+  if (!combos || !combos.length) return "";
+  const counts = c.combination_counts || {};
+  const rows = combos.map((item) =>
+    "<tr><td class='mono'>" + esc(item.parent) + "</td><td class='mono'>" + esc(item.dep) +
+    "</td><td class='st-" + item.status + "'>" + ST_STATUS_LABEL[item.status] +
+    "</td><td class='muted'>" + esc(item.reason) + "</td></tr>"
+  ).join("");
+  return '<details class="combos"><summary>候选许可证组合判定（共 ' + combos.length +
+    " 个：兼容 " + (counts.ok || 0) + " · 冲突 " + (counts.conflict || 0) +
+    " · 需人工确认 " + (counts.warning || 0) +
+    "；OR 选择关系，存在兼容组合即非硬冲突）</summary>" +
+    '<table><thead><tr><th>祖先候选</th><th>依赖候选</th><th>判定</th><th>兼容矩阵理由</th></tr></thead>' +
+    "<tbody>" + rows + "</tbody></table></details>";
 }
 
 // --- 最少断边分析 -------------------------------------------------------------
@@ -608,11 +653,24 @@ function renderNodes(result) {
     return `<tr>
       <td class="mono">${esc(n.name)}</td>
       <td class="mono">${n.version_unspecified ? '<span class="muted">未指定</span>' : esc(n.version)}</td>
-      <td><span class="badge ${catClass(n.license_category)}">${esc(n.license_display)}</span></td>
+      <td>${renderNodeLicense(n)}</td>
       <td>${cons}</td>
       <td>${n.conflict_count ? '<b style="color:var(--err)">' + n.conflict_count + '</b>' : '0'}</td>
     </tr>`;
   }).join("");
+}
+
+function renderNodeLicense(n) {
+  const badge = '<span class="badge ' + catClass(n.license_category) + '">' + esc(n.license_display) + "</span>";
+  const cands = n.license_candidates || [];
+  if (n.license_multi && cands.length > 1) {
+    const chips = cands.map((c) =>
+      '<li class="cand"><span class="badge ' + catClass(c.category) + '">' + esc(c.token) + "</span></li>"
+    ).join("");
+    return badge + ' <span class="pill">多候选（' + cands.length + " 选 1，OR）</span>" +
+      '<ul class="cand-list">' + chips + "</ul>";
+  }
+  return badge;
 }
 
 function renderWarnings(result) {
@@ -816,8 +874,9 @@ function renderFindingsBox(title, list) {
 }
 
 function renderLicensePair(b, t) {
-  const lb = b ? esc(b.license_display) : "—";
-  const lt = t ? esc(t.license_display) : "—";
+  const tag = (n) => (n && n.license_multi ? '<span class="badge cat-multi">多候选</span> ' : "");
+  const lb = b ? tag(b) + esc(b.license_display) : "—";
+  const lt = t ? tag(t) + esc(t.license_display) : "—";
   if (b && t && b.license !== t.license) {
     return '<span class="diff-remove">' + lb + "</span><span class='diff-arrow'>→</span><span class='diff-add'>" + lt + "</span>";
   }
@@ -1106,10 +1165,15 @@ function renderRetireResult(data) {
       '<div class="conflict ' + (c.severity === "error" ? "error" : "warning") + '">' +
       '<div class="head"><span class="badge ' + (c.severity === "error" ? "conflict" : "warning") + '">' +
       (c.severity === "error" ? "硬冲突" : "需人工确认") + "</span>" +
-      '<span class="mono"><b>' + esc(c.ancestor) + "</b> ── " + esc(c.ancestor_license) + " → " + esc(c.node_license) + " ── <b>" + esc(c.node) + "</b></span>" +
+      '<span class="mono"><b>' + esc(c.ancestor) + "</b> ── " +
+      (c.ancestor_multi ? '<span class="badge cat-multi">多候选</span> ' : "") + esc(c.ancestor_license) +
+      " → " +
+      (c.node_multi ? '<span class="badge cat-multi">多候选</span> ' : "") + esc(c.node_license) +
+      " ── <b>" + esc(c.node) + "</b></span>" +
       '<span class="pill">原最短路径 ' + c.distance + " 跳 · " + esc(c.id) + "</span></div>" +
       '<div class="reason">' + esc(c.reason) + "</div>" +
       renderRetirePath(c.path) +
+      (c.candidate_combinations && c.candidate_combinations.length ? renderCombinations(c) : "") +
       "</div>"
     ).join("");
   } else {

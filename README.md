@@ -65,6 +65,49 @@ manifest（或直接上传 **CycloneDX JSON** SBOM），系统会：
     并指出**首个不一致字段**；只有摘要与复算结果**都一致**才判通过。
     核验为纯只读操作（不创建审计、不改动复核标记），格式错误返回明确的 422 提示。
 
+## 多许可证候选（OR）组合判定
+
+当一个包声明了**多个可选许可证**（SPDX 的 OR 选择语义）时，工具不再把整个表达式
+当作无法识别的未知许可证，而是解析为**候选集合**逐一判定：
+
+- **原生 manifest**：`license` 支持字符串或数组——形如 `"MIT OR GPL-2.0"` 的纯 OR
+  表达式，或 `["MIT", "Apache-2.0"]` / `[{"id": "MIT"}, …]` 这样的**多个并列条目**，
+  都解析为候选（条目按声明顺序去重）；
+- **CycloneDX 组件**：`licenses` 中的 SPDX `id` / `expression` / `license.name`
+  同样处理——纯 ` OR ` 表达式与多个并列许可证条目都成为候选；
+- **组合判定**：祖先与依赖各有候选时，对每个 `(祖先候选, 依赖候选)` 组合逐一调用
+  现有兼容矩阵；**全部组合冲突才报硬冲突、全部兼容才判通过（不列出条目）**，
+  其余（存在可兼容组合但并非全部兼容，或组合中含需人工确认项）报**需人工确认**。
+  冲突/告警卡片可折叠展示**每个候选组合的判定（兼容/冲突/需人工确认）与矩阵逐条理由**，
+  并保留原**最短依赖路径**与跳数；汇总信息给出总组合数及三类计数；
+- **仍按未知处理的情况**：表达式含 `AND`、括号（如 `(MIT OR ISC)`）、`WITH` 或
+  任何矩阵外未知标识（如 `MIT OR OFL-1.1`），以及并列条目中混入未知许可证时，
+  不做候选拆分，整体保留原文标记为 unknown，相关边按“需人工确认”告警处理；
+- **单许可证语义不变**：只有一个许可证时结果结构与判定原因与旧版本完全一致
+  （冲突条目不带组合明细字段）。多候选节点的 `license_category` 为 `multi`，
+  节点额外携带 `license_candidates` / `license_tokens` / `license_multi` 字段。
+
+快速示例（祖先 `GPL-2.0 OR MIT`、依赖 `Apache-2.0`）：两个组合中
+`GPL-2.0→Apache-2.0` 冲突、`MIT→Apache-2.0` 兼容，因此整体**不报硬冲突**，
+判为「需人工确认」并列出两个组合的判定与原最短路径：
+
+```json
+{
+  "severity": "warning",
+  "ancestor": "app@1.0.0", "node": "lib@1.0.0",
+  "ancestor_license": "GPL-2.0 OR MIT", "node_license": "Apache-2.0",
+  "ancestor_multi": true, "node_multi": false,
+  "distance": 1, "path": ["app@1.0.0", "lib@1.0.0"],
+  "combination_counts": {"total": 2, "ok": 1, "conflict": 1, "warning": 0},
+  "candidate_combinations": [
+    {"parent": "GPL-2.0", "dep": "Apache-2.0", "status": "conflict",
+     "reason": "GPL-2.0 与 Apache-2.0 专利条款冲突，不能组合进同一作品。"},
+    {"parent": "MIT", "dep": "Apache-2.0", "status": "ok",
+     "reason": "宽松许可证对集成依赖无 copyleft 约束。"}
+  ]
+}
+```
+
 ## 快速开始（Docker Compose，一键启动，推荐）
 
 ```bash
@@ -137,7 +180,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   `edges` 声明依赖边，方向为 **使用方 → 被依赖方**，传递约束沿边传播；
 - 只给包名不给版本时，若 `packages` 中该名字唯一则自动解析，多个版本需用 `name@version` 消歧；
 - 无法解析到已声明节点的依赖会进入 `unresolved` 列表并产生告警，不会凭空造节点；
-- 未在矩阵中识别的许可证（如 `OFL-1.1`）保留原文并标记为 unknown，
+- 许可证字段支持字符串或数组：`"MIT OR GPL-2.0"` 这类纯 OR 表达式与
+  `["MIT", "Apache-2.0"]` 这类多个并列条目都按**多许可证候选**处理（详见
+  「多许可证候选（OR）组合判定」）；未在矩阵中识别的许可证（如 `OFL-1.1`），
+  以及含 `AND`、括号或未知标识的表达式，保留原文并标记为 unknown，
   相关边按“需人工确认”告警处理，而非误判为兼容；
 - 依赖环会被安全处理（BFS 节点只访问一次），不影响最短路径计算。
 
@@ -185,12 +231,15 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - **依赖边**：`dependencies[]` 按 `ref` / `dependsOn` 还原为「使用方 → 被依赖方」
   的依赖边，随后复用同一套兼容矩阵与最短路径冲突分析；
 - **许可证**：取组件 `licenses` 中的 SPDX `id` 或 `expression`（兜底取
-  `license.name`，同样走别名规范化）；多个并列 id/name 按 CycloneDX 的选择语义
-  以 ` OR ` 连接（通常会落入 unknown，交由人工确认）；**缺失许可证按未知处理**
+  `license.name`，同样走别名规范化）；纯 ` OR ` 表达式（如
+  `{"expression": "MIT OR Apache-2.0"}`）与多个并列 id/name 条目都解析为
+  **多许可证候选**（候选集合相同时视为同一许可证，允许合并）；含 `AND`、
+  括号或未知标识的表达式保留原文按未知处理；**缺失许可证按未知处理**
   （显示为 `UNLICENSED`，相关边按“需人工确认”告警）；
 - **422（不静默合并）**：同一 `bom-ref` 重复出现，或同名同版本组件对应不同许可证
-  （按规范化后的标识比较，`MIT` 与 `MIT License` 视为相同）时，返回明确的
-  `422` 错误并中止导入，需修正 BOM 后重新提交；
+  （单许可证按规范化标识比较，多候选按去重后的候选集合比较，`MIT` 与
+  `MIT License` 视为相同）时，返回明确的 `422` 错误并中止导入，需修正 BOM
+  后重新提交；
 - **未解析引用**：`dependencies` 中引用了不存在于 `components` 的 bom-ref 时，
   对应条目进入 `unresolved` 列表并产生告警，不会凭空造节点；
 - 结果与原生 manifest 完全一致地进入历史列表、参与两次审计对比、按包筛选与导出，
@@ -692,6 +741,9 @@ manifest 摘要、保存结果摘要与分析器复算三项校验结果，未�
     { "id": "pdf-export@4.0.0", "name": "pdf-export", "version": "4.0.0",
       "license_display": "Apache 2.0", "license": "Apache-2.0",
       "license_category": "permissive",
+      "license_multi": false,
+      "license_candidates": [ {"token": "AGPL-3.0", "display": "AGPL-3.0", "category": "strong-copyleft"} ],
+      "license_tokens": ["AGPL-3.0"],
       "constraints": [ { "from": "billing-core@1.2.0", "license": "GPL-2.0", "distance": 1, "status": "conflict" } ] }
   ],
   "conflicts": [
@@ -699,6 +751,7 @@ manifest 摘要、保存结果摘要与分析器复算三项校验结果，未�
       "id": "C001", "kind": "license-conflict", "severity": "error",
       "ancestor": "billing-core@1.2.0", "node": "pdf-export@4.0.0",
       "ancestor_license": "GPL-2.0", "node_license": "Apache 2.0",
+      "ancestor_multi": false, "node_multi": false,
       "distance": 1,
       "path": ["billing-core@1.2.0", "pdf-export@4.0.0"],
       "reason": "GPL-2.0 与 Apache-2.0 专利条款冲突，不能组合进同一作品。",
@@ -752,7 +805,7 @@ CycloneDX 导入的审计结果结构相同，另带 `"source_format": "cycloned
 ├── static/
 │   ├── index.html     # 单文件网页（无外部 CDN 依赖）
 │   └── examples/      # sample-manifest.json 与 sample-cyclonedx.json 两个内置示例
-├── tests/             # 轻量自测：python -m tests.test_analyzer / test_compare / test_reviews / test_cyclonedx / test_retire / test_relicense / test_edgefix / test_edgecut / test_repro
+├── tests/             # 轻量自测：python -m tests.test_analyzer / test_compare / test_reviews / test_cyclonedx / test_multi_license / test_retire / test_relicense / test_edgefix / test_edgecut / test_repro
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

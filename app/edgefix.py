@@ -61,6 +61,8 @@ def _node_brief(node: Dict[str, Any]) -> Dict[str, Any]:
         "license": node.get("license"),
         "license_known": node.get("license_known"),
         "license_category": node.get("license_category"),
+        "license_multi": node.get("license_multi", False),
+        "license_candidates": node.get("license_candidates", []),
         "conflict_count": node.get("conflict_count", 0),
     }
 

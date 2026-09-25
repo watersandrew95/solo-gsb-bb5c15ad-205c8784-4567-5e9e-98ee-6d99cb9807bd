@@ -9,7 +9,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from app import analyzer, compare as compare_mod, cyclonedx, database
+from app import analyzer, compare as compare_mod, cyclonedx, database, licenses
 
 # 隔离的临时数据库（database.connect 在调用时读取 DB_PATH，运行时替换即可）
 _TMP_DIR = tempfile.mkdtemp(prefix="cyclonedx-test-")
@@ -117,7 +117,16 @@ def test_license_sources() -> None:
             _comp("r2", "by-expression", "1", [{"expression": "GPL-3.0"}]),
             _comp("r3", "by-name", "1", [{"license": {"name": "Apache 2.0"}}]),
             _comp("r4", "missing", "1"),
-            _comp("r5", "weird-expression", "1", [{"expression": "MIT OR Apache-2.0"}]),
+            _comp("r5", "or-expression", "1", [{"expression": "MIT OR Apache-2.0"}]),
+            _comp("r6", "and-expression", "1", [{"expression": "MIT AND GPL-3.0"}]),
+            _comp("r7", "paren-expression", "1", [{"expression": "(MIT OR Apache-2.0)"}]),
+            _comp("r8", "unknown-or", "1", [{"expression": "MIT OR OFL-1.1"}]),
+            _comp(
+                "r9",
+                "parallel-entries",
+                "1",
+                [{"license": {"id": "MIT"}}, {"license": {"id": "Apache-2.0"}}],
+            ),
         ]
     )
     result = analyzer.analyze_manifest(bom)
@@ -134,10 +143,33 @@ def test_license_sources() -> None:
         and by_id["missing@1"]["license_display"] == "UNLICENSED",
         str(by_id["missing@1"]),
     )
+    # 纯 OR 表达式：矩阵内标识 -> 多候选
+    or_node = by_id["or-expression@1"]
     _check(
-        "composite expression unknown",
-        by_id["weird-expression@1"]["license_known"] is False,
-        str(by_id["weird-expression@1"]),
+        "pure OR expression parsed as candidates",
+        or_node["license_multi"] is True
+        and or_node["license_tokens"] == ["MIT", "Apache-2.0"]
+        and or_node["license_category"] == licenses.MULTI,
+        str(or_node),
+    )
+    # AND / 括号 / 含未知标识的 OR：仍按未知处理
+    for key, display in (
+        ("and-expression@1", "MIT AND GPL-3.0"),
+        ("paren-expression@1", "(MIT OR Apache-2.0)"),
+        ("unknown-or@1", "MIT OR OFL-1.1"),
+    ):
+        _check(
+            "%s stays unknown" % display,
+            by_id[key]["license_known"] is False and by_id[key]["license_multi"] is False,
+            str(by_id[key]),
+        )
+    # 多个并列许可证条目：同样按候选处理
+    parallel = by_id["parallel-entries@1"]
+    _check(
+        "parallel license entries become candidates",
+        parallel["license_multi"] is True
+        and parallel["license_tokens"] == ["MIT", "Apache-2.0"],
+        str(parallel),
     )
 
 

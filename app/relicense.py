@@ -69,6 +69,8 @@ def _node_brief(node: Dict[str, Any]) -> Dict[str, Any]:
         "license": node.get("license"),
         "license_known": node.get("license_known"),
         "license_category": node.get("license_category"),
+        "license_multi": node.get("license_multi", False),
+        "license_candidates": node.get("license_candidates", []),
         "conflict_count": node.get("conflict_count", 0),
     }
 
@@ -134,6 +136,17 @@ def _recompute_with_license(
     target["license"] = info["token"]
     target["license_known"] = True
     target["license_category"] = info["category"]
+    # 替换预演的候选恒为单个矩阵许可证，重置多候选相关字段
+    target["license_multi"] = False
+    target["license_candidates"] = [
+        {
+            "token": info["token"],
+            "display": info["display"],
+            "category": info["category"],
+            "category_label": info["category_label"],
+        }
+    ]
+    target["license_tokens"] = [info["token"]]
 
     edges = copy.deepcopy(result.get("edges", []) or [])
     unresolved = copy.deepcopy(result.get("unresolved", []) or [])
